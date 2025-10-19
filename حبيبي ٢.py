@@ -19,8 +19,41 @@ SMC (Pine-Equivalent 1:1) + Binance Futures Scanner + Telegram Notifier
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple, Literal
 from collections import deque
-import numpy as np
-import pandas as pd
+import math
+import time
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - fallback when numpy غير متاح
+    class _NPFallback:
+        inf = math.inf
+        nan = math.nan
+
+        @staticmethod
+        def isfinite(value: float) -> bool:
+            return math.isfinite(value)
+
+    np = _NPFallback()  # type: ignore
+
+try:
+    import pandas as pd  # type: ignore
+    _PD_AVAILABLE = True
+except Exception:  # pragma: no cover - fallback when pandas غير متاح
+    _PD_AVAILABLE = False
+
+    class _PDFallback:
+        """بديل خفيف لتجنّب أخطاء وقت الاستيراد عند غياب pandas."""
+
+        _is_stub = True
+
+        class DataFrame:  # type: ignore
+            pass
+
+        class Series:  # type: ignore
+            pass
+
+    pd = _PDFallback()  # type: ignore
+
 import os
 import sys
 
@@ -63,6 +96,10 @@ class Settings:
     merge_ratio: float = 0.10
     tg_enable: bool = False
     tg_title_prefix: str = "SMC Alert"
+    structure_type: Literal["Choch without IDM", "Choch with IDM"] = "Choch with IDM"
+    enable_golden_zone_alerts: bool = True
+    golden_ratio_top: float = 0.78
+    golden_ratio_bottom: float = 0.61
 
 
 # =========================
@@ -105,22 +142,56 @@ class DigitalBookkeeping:
     def pushIdmLabel(self, code: int):self.arrIdmLabel.append(code)
     def pushIdmLine(self, code: int): self.arrIdmLine.append(code)
 
-    # pop helpers
-    def _pop_safe(self, arr: List):
-        if arr: arr.pop()
-    def _pop_n(self, arr: List, n: int):
-        for _ in range(min(n, len(arr))): arr.pop()
+    # مطابق لعدد الحذف في Pine — نضع None بدل حذف العنصر للحفاظ على الطول
+    @staticmethod
+    def _mark_last(arr: List, count: int):
+        rng = min(count, len(arr))
+        for idx in range(1, rng + 1):
+            arr[-idx] = None
 
-    # مطابق لعدد الحذف في Pine
+    @staticmethod
+    def _mark_nth(arr: List, n: int):
+        if 0 < n <= len(arr):
+            arr[-n] = None
+
     def fixStrcAfterBos(self):
-        self._pop_safe(self.arrBCLabel); self._pop_safe(self.arrBCLine)
-        self._pop_safe(self.arrIdmLabel); self._pop_safe(self.arrIdmLine)
-        self._pop_n(self.arrHLLabel, 2); self._pop_n(self.arrHLCircle, 2)
+        self._mark_last(self.arrBCLabel, 1)
+        self._mark_last(self.arrBCLine, 1)
+        self._mark_last(self.arrIdmLabel, 1)
+        self._mark_last(self.arrIdmLine, 1)
+        self._mark_last(self.arrHLLabel, 2)
+        self._mark_last(self.arrHLCircle, 2)
 
     def fixStrcAfterChoch(self):
-        self._pop_n(self.arrBCLabel, 2); self._pop_n(self.arrBCLine, 2)
-        self._pop_n(self.arrHLLabel, 3); self._pop_n(self.arrHLCircle, 3)
-        self._pop_n(self.arrIdmLabel, 2); self._pop_n(self.arrIdmLine, 2)
+        self._mark_last(self.arrBCLabel, 2)
+        self._mark_last(self.arrBCLine, 2)
+        self._mark_nth(self.arrHLLabel, 2)
+        self._mark_nth(self.arrHLLabel, 3)
+        self._mark_nth(self.arrHLCircle, 2)
+        self._mark_nth(self.arrHLCircle, 3)
+        self._mark_nth(self.arrIdmLabel, 2)
+        self._mark_nth(self.arrIdmLine, 2)
+
+    # أدوات جلب قيم arrLast*
+    @staticmethod
+    def _get_last(arr: List, n: int = 1):
+        if n <= 0:
+            raise ValueError("n must be positive")
+        if len(arr) >= n:
+            return arr[-n]
+        return None
+
+    def last_high(self, n: int = 1):
+        return self._get_last(self.arrLastH, n)
+
+    def last_high_bar(self, n: int = 1):
+        return self._get_last(self.arrLastHBar, n)
+
+    def last_low(self, n: int = 1):
+        return self._get_last(self.arrLastL, n)
+
+    def last_low_bar(self, n: int = 1):
+        return self._get_last(self.arrLastLBar, n)
 
 
 # =========================
@@ -139,6 +210,26 @@ class Zone:
     kind: ZoneKind
     label: ZoneLabel = ""
     state: ZoneState = "FRESH"
+    uid: int = 0
+    alerts_sent: Dict[str, bool] = field(default_factory=dict)
+
+
+ALERT_CONCEPT_MAP: Dict[str, str] = {
+    "BOS": "MARKET STRUCTURE",
+    "BOS+": "MARKET STRUCTURE",
+    "CHOCH": "MARKET STRUCTURE",
+    "X  تنبيه انشاء حديثا": "MARKET STRUCTURE",
+    "EXT OB تنبيه انشاء حديثا": "ZONE TYPE",
+    "EXT OB. تمت ملامسه المنطقه": "ZONE TYPE",
+    "Hist EXT OB تمت ملامسه المنطقه": "ZONE TYPE",
+    "IDM OB تنبيه انشاء حديثا": "ORDER BLOCK",
+    "IDM OB تمت ملامسه المنطقه": "ORDER BLOCK",
+    "Hist IDM OB تمت ملامسه المنطقه": "ORDER BLOCK",
+    "IDM تنبيه انشاء حديثا": "PULLBACK",
+    "IDM تمت ملامسه المنطقه": "PULLBACK",
+    "Golden zone.  تنبيه انشاء جديثا": "PULLBACK",
+    "Golden zone  تمت ملامسه المنطقه": "PULLBACK",
+}
 
 
 # =========================
@@ -213,7 +304,10 @@ class SMCIndicator:
         self._choch_dn: List[bool] = []
         self._idm_touch_supply: List[bool] = []
         self._idm_touch_demand: List[bool] = []
-        self._idm_touch_seen_this_bar = set()
+        self._zone_seq = 0
+        self._last_alert_signature: Dict[Tuple[str, Optional[str]], Tuple[int, float]] = {}
+        self._sweep_last_bar: Dict[bool, int] = {True: -1, False: -1}
+        self.golden_zone: Optional[Dict[str, float]] = None
 
     # ---------- Helpers ----------
     @staticmethod
@@ -224,6 +318,74 @@ class SMCIndicator:
         if len(self.isb_hist) <= bars_back:
             return False
         return bool(list(self.isb_hist)[-1 - bars_back])
+
+    def _next_zone_id(self) -> int:
+        self._zone_seq += 1
+        return self._zone_seq
+
+    @staticmethod
+    def _direction_text(is_bullish: bool) -> str:
+        return "صاعد" if is_bullish else "هابط"
+
+    def _emit_alert(self, bar: int, alert_type: str, price: Optional[float] = None,
+                    direction: Optional[bool] = None, box: Optional[Tuple[float, float]] = None,
+                    concept: Optional[str] = None):
+        dir_text: Optional[str] = None
+        if direction is not None:
+            dir_text = self._direction_text(direction)
+        signature = (alert_type, dir_text)
+        price_val = float(price) if price is not None else float('nan')
+        last_info = self._last_alert_signature.get(signature)
+        if last_info and last_info[0] == bar and (
+            (math.isnan(price_val) and math.isnan(last_info[1])) or
+            (not math.isnan(price_val) and not math.isnan(last_info[1]) and
+             abs(price_val - last_info[1]) <= self.cfg.eps)
+        ):
+            return
+        self._last_alert_signature[signature] = (bar, price_val)
+        payload = {
+            "bar": bar,
+            "type": alert_type,
+            "price": price_val,
+            "box": box,
+            "direction": dir_text,
+            "concept": concept or ALERT_CONCEPT_MAP.get(alert_type, ""),
+        }
+        self.alerts.append(payload)
+
+    @staticmethod
+    def _zone_price_range(z: Zone) -> Tuple[float, float]:
+        top = max(z.top, z.bottom)
+        bottom = min(z.top, z.bottom)
+        return top, bottom
+
+    @staticmethod
+    def _zone_touch_key(kind: str) -> str:
+        return f"touch:{kind}"
+
+    @staticmethod
+    def _zone_creation_key(kind: str) -> str:
+        return f"create:{kind}"
+
+    @staticmethod
+    def _mark_zone_alert(zone: Zone, key: str) -> bool:
+        if zone.alerts_sent.get(key):
+            return False
+        zone.alerts_sent[key] = True
+        return True
+
+    def _current_zone_snapshot(self) -> Tuple[str, str]:
+        active = [z for z in self.zones if z.state in ("FRESH", "ACTIVATED")]
+        priority = ["IDM OB", "EXT OB", "Hist IDM OB", "Hist EXT OB"]
+        for label in priority:
+            for z in reversed(active):
+                if z.label == label:
+                    return label, z.kind
+        if active:
+            z = active[-1]
+            label = z.label if z.label else "UNLABELED"
+            return label, z.kind
+        return "", ""
 
     # ---------- IDM buffers update (كما في Pine) ----------
     def _update_idm_buffers(self, hi: float, lo: float, op: float, cl: float, b: int):
@@ -295,6 +457,8 @@ class SMCIndicator:
     def _merge_or_add_zone(self, candidate: Zone):
         same_kind = [z for z in reversed(self.zones) if z.kind == candidate.kind]
         if not same_kind:
+            candidate.uid = self._next_zone_id()
+            candidate.alerts_sent = {}
             self.zones.append(candidate); return
         last = same_kind[0]
         # overlap ratio
@@ -313,6 +477,8 @@ class SMCIndicator:
             last.left_index = min(last.left_index, candidate.left_index)
             last.right_index = max(last.right_index, candidate.right_index)
         else:
+            candidate.uid = self._next_zone_id()
+            candidate.alerts_sent = {}
             self.zones.append(candidate)
 
     # ---------- EXT = NEAREST على الكسر ----------
@@ -337,6 +503,12 @@ class SMCIndicator:
                 z.label = "Hist EXT OB"
         chosen.label = "EXT OB"
         chosen.state = "ACTIVATED"
+        if self._mark_zone_alert(chosen, self._zone_creation_key("EXT OB")):
+            is_bullish = chosen.kind == "DEMAND"
+            mid_price = (chosen.top + chosen.bottom) / 2.0
+            self._emit_alert(chosen.right_index, "EXT OB تنبيه انشاء حديثا",
+                             price=mid_price, direction=is_bullish,
+                             box=[chosen.bottom, chosen.top])
 
     # ---------- تفعيل/أخذ IDM + أول ملامسة ----------
     def _activate_idm_from_candidates(self, trend_up: bool):
@@ -362,12 +534,92 @@ class SMCIndicator:
                 z2.label = "Hist IDM OB"
         chosen.label = "IDM OB"
         chosen.state = "ACTIVATED"
+        if self._mark_zone_alert(chosen, self._zone_creation_key("IDM OB")):
+            is_bullish = chosen.kind == "DEMAND"
+            mid_price = (chosen.top + chosen.bottom) / 2.0
+            self._emit_alert(chosen.right_index, "IDM OB تنبيه انشاء حديثا",
+                             price=mid_price, direction=is_bullish,
+                             box=[chosen.bottom, chosen.top])
+
+    def _update_golden_zone(self, i: int, hi: float, lo: float,
+                            prev_hi: float, prev_lo: float):
+        if not self.cfg.enable_golden_zone_alerts:
+            return
+        if self.lastHBar < 0 or self.lastLBar < 0:
+            return
+        anchor = min(self.lastHBar, self.lastLBar)
+        dir_up = self.lastLBar < self.lastHBar
+        range_high = self.lastH if dir_up else self.lastL
+        range_low = self.lastL if dir_up else self.lastH
+        range_span = range_high - range_low
+        if abs(range_span) <= self.cfg.eps:
+            return
+        top_lvl = range_high - range_span * self.cfg.golden_ratio_top
+        bot_lvl = range_high - range_span * self.cfg.golden_ratio_bottom
+        zone_top = max(top_lvl, bot_lvl)
+        zone_bottom = min(top_lvl, bot_lvl)
+        needs_new = (
+            self.golden_zone is None or
+            self.golden_zone.get("anchor") != anchor or
+            self.golden_zone.get("dir_up") != dir_up or
+            abs(self.golden_zone.get("top", 0.0) - zone_top) > self.cfg.eps or
+            abs(self.golden_zone.get("bottom", 0.0) - zone_bottom) > self.cfg.eps
+        )
+        if needs_new:
+            self.golden_zone = {
+                "anchor": anchor,
+                "dir_up": dir_up,
+                "top": zone_top,
+                "bottom": zone_bottom,
+                "touched": False,
+            }
+            mid_price = (zone_top + zone_bottom) / 2.0
+            self._emit_alert(i, "Golden zone.  تنبيه انشاء جديثا",
+                             price=mid_price, direction=dir_up,
+                             box=[zone_bottom, zone_top])
+        if not self.golden_zone:
+            return
+        if self.golden_zone.get("touched"):
+            return
+        current_overlap = (hi >= zone_bottom - self.cfg.eps) and (lo <= zone_top + self.cfg.eps)
+        prev_overlap = (prev_hi >= zone_bottom - self.cfg.eps) and (prev_lo <= zone_top + self.cfg.eps)
+        if current_overlap and not prev_overlap:
+            self.golden_zone["touched"] = True
+            mid_price = (zone_top + zone_bottom) / 2.0
+            self._emit_alert(i, "Golden zone  تمت ملامسه المنطقه",
+                             price=mid_price, direction=self.golden_zone.get("dir_up", True),
+                             box=[zone_bottom, zone_top])
+
+    def _detect_sweep_x(self, i: int, hi: float, lo: float, cl: float,
+                        prev_hi: float, prev_lo: float):
+        bull_sweep = (lo < prev_lo - self.cfg.eps) and (cl > prev_lo + self.cfg.eps)
+        bear_sweep = (hi > prev_hi + self.cfg.eps) and (cl < prev_hi - self.cfg.eps)
+        if bull_sweep and self._sweep_last_bar[True] != i:
+            self._sweep_last_bar[True] = i
+            self._emit_alert(i, "X  تنبيه انشاء حديثا", price=lo, direction=True)
+        if bear_sweep and self._sweep_last_bar[False] != i:
+            self._sweep_last_bar[False] = i
+            self._emit_alert(i, "X  تنبيه انشاء حديثا", price=hi, direction=False)
 
     def _idm_take_unlock(self, trend_up: bool, hi: float, lo: float, cl: float, i: int):
         if trend_up:
             take = (lo < self.idmLow - self.cfg.eps) if self.cfg.mitigation_mode == "WICK" \
                    else (cl < self.idmLow - self.cfg.eps)
             if take:
+                self._emit_alert(i, "IDM تمت ملامسه المنطقه", price=self.idmLow,
+                                 direction=True)
+                if (self.cfg.structure_type == "Choch with IDM" and
+                        abs(self.idmLow - self.lastL) <= self.cfg.eps):
+                    if self.isPrevBos:
+                        self.bk.fixStrcAfterBos()
+                        new_last_l = self.bk.last_low(1)
+                        new_last_l_bar = self.bk.last_low_bar(1)
+                        if new_last_l is not None:
+                            self.lastL = new_last_l
+                        if new_last_l_bar is not None:
+                            self.lastLBar = new_last_l_bar
+                    else:
+                        self.bk.fixStrcAfterChoch()
                 self.findIDM = False; self.isBosUp = False
                 self._activate_idm_from_candidates(True)
                 # مراسي حدثية بعد الأخذ
@@ -376,34 +628,58 @@ class SMCIndicator:
             take = (hi > self.idmHigh + self.cfg.eps) if self.cfg.mitigation_mode == "WICK" \
                    else (cl > self.idmHigh + self.cfg.eps)
             if take:
+                self._emit_alert(i, "IDM تمت ملامسه المنطقه", price=self.idmHigh,
+                                 direction=False)
+                if (self.cfg.structure_type == "Choch with IDM" and
+                        abs(self.idmHigh - self.lastH) <= self.cfg.eps):
+                    if self.isPrevBos:
+                        self.bk.fixStrcAfterBos()
+                        new_last_h = self.bk.last_high(1)
+                        new_last_h_bar = self.bk.last_high_bar(1)
+                        if new_last_h is not None:
+                            self.lastH = new_last_h
+                        if new_last_h_bar is not None:
+                            self.lastHBar = new_last_h_bar
+                    else:
+                        self.bk.fixStrcAfterChoch()
                 self.findIDM = False; self.isBosDn = False
                 self._activate_idm_from_candidates(False)
                 self.lastL, self.lastLBar = self.L, self.LBar
 
     def _first_touch_idm(self, i: int, df: pd.DataFrame):
-        if not self.cfg.enable_alert_idm_touch or i < 1:
+        if i < 1:
             return (False, False)
-        self._idm_touch_seen_this_bar.clear()
-        prev_high = float(df.high.iloc[i-1]); prev_low  = float(df.low.iloc[i-1])
-        hi = float(df.high.iloc[i]);          lo = float(df.low.iloc[i])
+        prev_high = float(df.high.iloc[i-1]); prev_low = float(df.low.iloc[i-1])
+        hi = float(df.high.iloc[i]);         lo = float(df.low.iloc[i])
         touch_s = touch_d = False
         for z in self.zones:
-            if not (z.label == "IDM OB" and z.state == "ACTIVATED"):
+            top, bottom = self._zone_price_range(z)
+            is_supply_touch = z.kind == "SUPPLY" and (
+                hi >= bottom - self.cfg.eps and prev_high < bottom - self.cfg.eps)
+            is_demand_touch = z.kind == "DEMAND" and (
+                lo <= top + self.cfg.eps and prev_low > top + self.cfg.eps)
+            if not (is_supply_touch or is_demand_touch):
                 continue
-            key = (z.kind, z.left_index, z.right_index)
-            if key in self._idm_touch_seen_this_bar:
-                continue
-            if z.kind == "SUPPLY":
-                is_new = (hi >= z.bottom - self.cfg.eps) and (prev_high < z.bottom - self.cfg.eps)
-                if is_new:
-                    touch_s = True; self._idm_touch_seen_this_bar.add(key)
-                    self.alerts.append({"bar": i, "type": "IDM Supply Touch", "price": z.bottom, "box": [z.bottom, z.top]})
-            else:
-                is_new = (lo <= z.top + self.cfg.eps) and (prev_low > z.top + self.cfg.eps)
-                if is_new:
-                    touch_d = True; self._idm_touch_seen_this_bar.add(key)
-                    self.alerts.append({"bar": i, "type": "IDM Demand Touch", "price": z.top, "box": [z.bottom, z.top]})
-        return (touch_s, touch_d)
+            if z.label in {"IDM OB", "Hist IDM OB"}:
+                if z.kind == "SUPPLY":
+                    touch_s = True
+                else:
+                    touch_d = True
+            alert_name = {
+                "IDM OB": "IDM OB تمت ملامسه المنطقه",
+                "Hist IDM OB": "Hist IDM OB تمت ملامسه المنطقه",
+                "EXT OB": "EXT OB. تمت ملامسه المنطقه",
+                "Hist EXT OB": "Hist EXT OB تمت ملامسه المنطقه",
+            }.get(z.label)
+            if alert_name:
+                key = self._zone_touch_key(z.label)
+                if self._mark_zone_alert(z, key):
+                    price = bottom if z.kind == "SUPPLY" else top
+                    self._emit_alert(i, alert_name, price=price,
+                                     direction=(z.kind == "DEMAND"),
+                                     box=[z.bottom, z.top])
+        return (touch_s and self.cfg.enable_alert_idm_touch,
+                touch_d and self.cfg.enable_alert_idm_touch)
 
     # ---------- خريطة الهيكل (BOS/CHoCh) — مع تمهيد الاتجاه لأول BOS ----------
     def _structure_mapping(self, hi: float, lo: float, cl: float, i: int):
@@ -420,7 +696,8 @@ class SMCIndicator:
             self.lastL, self.lastLBar = self.L, self.LBar
             choch_up = True
             if self.cfg.enable_alert_choch:
-                self.alerts.append({"bar": i, "type": "CHoCh Up", "price": self.lastH})
+                self._emit_alert(i, "CHOCH", price=self.lastH, direction=True)
+            self._emit_alert(i, "IDM تنبيه انشاء حديثا", price=self.lastL, direction=True)
 
         # CHoCh Down
         if self.isCocUp and (not self.findIDM) and self.has_bos and (cl < self.lastL - self.cfg.eps):
@@ -433,10 +710,12 @@ class SMCIndicator:
             self.lastH, self.lastHBar = self.H, self.HBar
             choch_dn = True
             if self.cfg.enable_alert_choch:
-                self.alerts.append({"bar": i, "type": "CHoCh Down", "price": self.lastL})
+                self._emit_alert(i, "CHOCH", price=self.lastL, direction=False)
+            self._emit_alert(i, "IDM تنبيه انشاء حديثا", price=self.lastH, direction=False)
 
         # BOS Up — أول BOS بدون isCocUp لتمهيد الاتجاه
         if (not self.findIDM) and (not self.isBosUp) and (cl > self.lastH + self.cfg.eps):
+            prev_bos_state = self.isPrevBos
             self.findIDM = True
             self.isBosUp = self.isCocUp = True
             self.isBosDn = self.isCocDn = False
@@ -446,10 +725,13 @@ class SMCIndicator:
             bos_up = True
             self._select_ext_on_break(True)
             if self.cfg.enable_alert_bos:
-                self.alerts.append({"bar": i, "type": "BOS Up", "price": self.lastH})
+                label = "BOS+" if prev_bos_state else "BOS"
+                self._emit_alert(i, label, price=self.lastH, direction=True)
+            self._emit_alert(i, "IDM تنبيه انشاء حديثا", price=self.lastL, direction=True)
 
         # BOS Down — أول BOS بدون isCocDn لتمهيد الاتجاه
         if (not self.findIDM) and (not self.isBosDn) and (cl < self.lastL - self.cfg.eps):
+            prev_bos_state = self.isPrevBos
             self.findIDM = True
             self.isBosUp = self.isCocUp = False
             self.isBosDn = self.isCocDn = True
@@ -459,7 +741,9 @@ class SMCIndicator:
             bos_dn = True
             self._select_ext_on_break(False)
             if self.cfg.enable_alert_bos:
-                self.alerts.append({"bar": i, "type": "BOS Down", "price": self.lastL})
+                label = "BOS+" if prev_bos_state else "BOS"
+                self._emit_alert(i, label, price=self.lastL, direction=False)
+            self._emit_alert(i, "IDM تنبيه انشاء حديثا", price=self.lastH, direction=False)
 
         # IDM take (WICK/CLOSE)
         if self.findIDM and self.isCocUp:
@@ -471,6 +755,8 @@ class SMCIndicator:
 
     # ---------- التشغيل ----------
     def run(self, df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        if not _PD_AVAILABLE:
+            raise RuntimeError("pandas غير مثبت. ثبّت pandas لاستخدام SMCIndicator.run")
         # تحضير الداتا (تأمين الأنواع)
         for col in ['open','high','low','close','volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -480,6 +766,10 @@ class SMCIndicator:
         self._bos_up = [False]*n; self._bos_dn = [False]*n
         self._choch_up = [False]*n; self._choch_dn = [False]*n
         self._idm_touch_supply = [False]*n; self._idm_touch_demand = [False]*n
+        market_structure_state: List[str] = ["RANGE"] * n
+        pullback_state: List[str] = ["IMPULSE"] * n
+        order_block_label: List[str] = [""] * n
+        zone_type_state: List[str] = [""] * n
 
         # تهيئة آمنة
         if n > 0:
@@ -493,6 +783,8 @@ class SMCIndicator:
         for i in range(n):
             op = float(df['open'].iloc[i]); hi = float(df['high'].iloc[i])
             lo = float(df['low'].iloc[i]);  cl = float(df['close'].iloc[i])
+            prev_hi = float(df['high'].iloc[i-1]) if i > 0 else hi
+            prev_lo = float(df['low'].iloc[i-1]) if i > 0 else lo
 
             # 1) IDM buffers
             self._update_idm_buffers(hi,lo,op,cl,i)
@@ -523,6 +815,13 @@ class SMCIndicator:
             self._bos_up[i]=bos_up; self._bos_dn[i]=bos_dn
             self._choch_up[i]=choch_up; self._choch_dn[i]=choch_dn
 
+            # 5.0) Sweep X detection
+            if i > 0:
+                self._detect_sweep_x(i, hi, lo, cl, prev_hi, prev_lo)
+
+            # 5.1) Golden zone
+            self._update_golden_zone(i, hi, lo, prev_hi, prev_lo)
+
             # 6) أول ملامسة IDM
             touch_s, touch_d = self._first_touch_idm(i, df)
             self._idm_touch_supply[i] = touch_s
@@ -536,6 +835,14 @@ class SMCIndicator:
                 if swept:
                     self.zones.remove(z)
 
+            ms_dir = "UP" if (self.isBosUp or self.isCocUp) else \
+                     "DOWN" if (self.isBosDn or self.isCocDn) else "RANGE"
+            market_structure_state[i] = ms_dir
+            pullback_state[i] = "PULLBACK" if self.findIDM else "IMPULSE"
+            ob_label, zone_kind = self._current_zone_snapshot()
+            order_block_label[i] = ob_label
+            zone_type_state[i] = zone_kind
+
         # مخرجات رقمية فقط
         signals_df = pd.DataFrame({
             "bos_up": self._bos_up,
@@ -544,6 +851,10 @@ class SMCIndicator:
             "choch_dn": self._choch_dn,
             "idm_touch_supply": self._idm_touch_supply,
             "idm_touch_demand": self._idm_touch_demand,
+            "market_structure": market_structure_state,
+            "pullback_state": pullback_state,
+            "active_order_block": order_block_label,
+            "zone_type": zone_type_state,
         }, index=df.index)
 
         levels_df = pd.DataFrame({
@@ -561,7 +872,7 @@ class SMCIndicator:
                    pd.DataFrame(columns=["left_index","right_index","top","bottom","kind","label","state"])
 
         alerts_df = pd.DataFrame(self.alerts) if self.alerts else \
-                    pd.DataFrame(columns=["bar","type","price","box"])
+                    pd.DataFrame(columns=["bar","type","price","box","direction","concept"])
 
         bookkeeping_df = pd.DataFrame({
             "arrLastH":   [self.bk.arrLastH],
@@ -648,6 +959,8 @@ class FuturesScanner:
         self.tg = TelegramNotifier() if cfg.tg_enable else None
 
     def _fmt_price(self, p: float) -> str:
+        if not math.isfinite(p):
+            return "-"
         if p >= 100: return f"{p:.2f}"
         if p >= 1:   return f"{p:.4f}"
         return f"{p:.6f}"
@@ -673,6 +986,9 @@ class FuturesScanner:
               f"lastL:{self._fmt_price(float(last_levels['lastL']))}")
 
     def run(self):
+        if not _PD_AVAILABLE:
+            print("[SCAN] pandas غير متاح. ثبّت الحزمة: pip install pandas")
+            return
         if not self.fetcher:
             print("[SCAN] python-binance غير متاح. ثبّت الحزمة: pip install python-binance")
             return
@@ -690,39 +1006,56 @@ class FuturesScanner:
         tf = self.timeframe
         lim = self.limit
 
-        for sym in symbols:
-            df = self.fetcher.fetch_ohlcv(sym, tf, lim)
-            if df is None or df.empty:
-                if self.verbose:
-                    print(f"[{sym} {tf}] لا توجد بيانات OHLCV (df فارغ).")
-                continue
+        for idx, sym in enumerate(symbols):
+            try:
+                df = self.fetcher.fetch_ohlcv(sym, tf, lim)
+                if df is None or df.empty:
+                    if self.verbose:
+                        print(f"[{sym} {tf}] لا توجد بيانات OHLCV (df فارغ).")
+                    continue
 
-            # خيار تجاهل الشمعة الأخيرة (مضاهاة Pine على الشموع المؤكدة فقط)
-            if self.drop_last and len(df) > 0:
-                df = df.iloc[:-1].copy()
+                # خيار تجاهل الشمعة الأخيرة (مضاهاة Pine على الشموع المؤكدة فقط)
+                if self.drop_last and len(df) > 0:
+                    df = df.iloc[:-1].copy()
 
-            engine = SMCIndicator(self.cfg)
-            out = engine.run(df)
-            alerts_df = out["alerts"]
+                engine = SMCIndicator(self.cfg)
+                out = engine.run(df)
+                alerts_df = out["alerts"]
 
-            last_bar_idx = len(df) - 1
-            if not alerts_df.empty:
-                recent_cut = last_bar_idx - (self.recent_bars - 1)
-                recent_alerts = alerts_df[alerts_df["bar"] >= recent_cut]
-            else:
-                recent_alerts = pd.DataFrame()
+                last_bar_idx = len(df) - 1
+                if not alerts_df.empty:
+                    recent_cut = last_bar_idx - (self.recent_bars - 1)
+                    recent_alerts = alerts_df[alerts_df["bar"] >= recent_cut]
+                    if not recent_alerts.empty:
+                        recent_alerts = recent_alerts.sort_values("bar")
+                        subset_key = "concept" if "concept" in recent_alerts.columns else "type"
+                        if subset_key in recent_alerts.columns:
+                            recent_alerts = recent_alerts.drop_duplicates(subset=[subset_key], keep="last")
+                else:
+                    recent_alerts = pd.DataFrame()
 
-            if not recent_alerts.empty:
-                for _, a in recent_alerts.tail(20).iterrows():
-                    typ = str(a.get("type", "ALERT"))
-                    price = float(a.get("price", 0.0))
-                    msg = f"[{sym} {tf}] {typ} @ {self._fmt_price(price)}"
-                    print(msg)
-                    if self.tg:
-                        self.tg.send(f"{self.cfg.tg_title_prefix}: {msg}")
-            else:
-                if self.verbose:
-                    self._print_summary(sym, tf, out)
+                if not recent_alerts.empty:
+                    for _, a in recent_alerts.tail(20).iterrows():
+                        typ = str(a.get("type", "ALERT"))
+                        price = float(a.get("price", 0.0))
+                        direction_txt = str(a.get("direction", "")).strip()
+                        concept_txt = str(a.get("concept", "")).strip()
+                        label_parts = []
+                        if concept_txt and concept_txt != "nan":
+                            label_parts.append(concept_txt)
+                        if direction_txt and direction_txt != "nan":
+                            label_parts.append(direction_txt)
+                        label_str = f"{' | '.join(label_parts)} - " if label_parts else ""
+                        msg = f"[{sym} {tf}] {label_str}{typ} @ {self._fmt_price(price)}"
+                        print(msg)
+                        if self.tg:
+                            self.tg.send(f"{self.cfg.tg_title_prefix}: {msg}")
+                else:
+                    if self.verbose:
+                        self._print_summary(sym, tf, out)
+            finally:
+                if idx < len(symbols) - 1:
+                    time.sleep(5)
 
 
 # =========================
@@ -743,6 +1076,10 @@ if __name__ == "__main__":
                         help="عدد أعلى رموز USDT بالحجم (افتراضي: 30)")
     parser.add_argument("--mitigation", choices=["WICK","CLOSE"], default="WICK",
                         help="طريقة الـMitigation: WICK للذيل أو CLOSE للإغلاق")
+    parser.add_argument("--structure-type",
+                        choices=["Choch without IDM", "Choch with IDM"],
+                        default="Choch with IDM",
+                        help="مطابقة Pine: اختر منطق CHoCh بدون/مع IDM")
     parser.add_argument("--tg", action="store_true", default=False,
                         help="إرسال التنبيهات لتلغرام (يتطلب TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID)")
     parser.add_argument("--symbol", "-s", default="",
@@ -775,7 +1112,8 @@ if __name__ == "__main__":
         mitigation_mode=args.mitigation,
         merge_ratio=0.10,
         tg_enable=bool(args.tg),
-        tg_title_prefix="SMC Alert"
+        tg_title_prefix="SMC Alert",
+        structure_type=args.structure_type,
     )
 
     scanner = FuturesScanner(cfg,
